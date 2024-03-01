@@ -9,7 +9,7 @@ import torch
 from torch import nn, einsum, Tensor
 import torch.nn.functional as F
 from torch.cuda.amp import autocast
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from torch.utils.data import Dataset, DataLoader
 
 from einops import rearrange, reduce
@@ -289,7 +289,7 @@ class Unet1D(nn.Module):
 
         # time embeddings
 
-        time_dim = dim * 4
+        time_dim = dim * 4   # need to modify this time dim to include the dimension of the other conditional embeddings
 
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
 
@@ -306,6 +306,15 @@ class Unet1D(nn.Module):
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
         )
+
+        self.features_mlps = [nn.Sequential(
+            sinu_pos_emb,
+            nn.Linear(fourier_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )] * 2
+
+        time_dim = time_dim * 3
 
         # layers
 
@@ -344,7 +353,7 @@ class Unet1D(nn.Module):
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = time_dim)
         self.final_conv = nn.Conv1d(dim, self.out_dim, 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None, labels = None):
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
@@ -353,6 +362,9 @@ class Unet1D(nn.Module):
         r = x.clone()
 
         t = self.time_mlp(time)
+        feature1 = self.features_mlps[0](labels[0])
+        feature2 = self.features_mlps[1](labels[1])
+        t = torch.cat((t, feature1, feature2), dim = 1)
 
         h = []
 
@@ -667,7 +679,7 @@ class GaussianDiffusion1D(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None):
+    def p_losses(self, x_start, t, labels=None, noise=None):
         b, c, n = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -687,7 +699,12 @@ class GaussianDiffusion1D(nn.Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        # model_out = self.model(x, t, x_self_cond)
+        # implement random label drop
+        if random() < 0.1:
+            model_out = self.model(x, t, x_self_cond, labels=None)
+        else:
+            model_out = self.model(x, t, x_self_cond, labels=labels)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -705,13 +722,14 @@ class GaussianDiffusion1D(nn.Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
-        b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
+    def forward(self, data, *args, **kwargs):
+        img, labels = data
+        b, c, n, device, seq_length, = *img.shape, data.device, self.seq_length
         assert n == seq_length, f'seq length must be {seq_length}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        return self.p_losses(img, t, labels=labels, *args, **kwargs)
 
 # trainer class
 
@@ -770,8 +788,8 @@ class Trainer1D(object):
         self.dl = cycle(dl)
 
         # optimizer
-
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+        self.opt = AdamW(diffusion_model.parameters(), lr = train_lr, betas = adam_betas) # changed from Adam to AdamW
+        # self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
 
         # for logging results in a folder periodically
 
